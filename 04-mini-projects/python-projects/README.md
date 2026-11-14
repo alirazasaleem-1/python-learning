@@ -18,8 +18,8 @@ A collection of beginner-to-intermediate Python command-line projects I built wh
 ## 🚀 Getting started
 
 ```bash
-git clone https://github.com/alirazasaleem-1/01_PYTHON.git
-cd 01_PYTHON/04-mini-projects/python-projects
+git clone https://github.com/alirazasaleem-1/python-learning.git
+cd python-learning/04-mini-projects/python-projects
 pip install -r requirements.txt
 python expense_tracker.py
 ```
