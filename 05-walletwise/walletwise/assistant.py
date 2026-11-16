@@ -1,10 +1,11 @@
-"""WalletWise AI: chat with Claude about your money.
+"""WalletWise AI: chat with an AI about your money.
 
-Claude gets your whole money story (every transaction, balances, goals, budgets and
-what it remembers about you) and a set of tools (see tools.py) to look things up
-and to save new entries. It is the flexible, talk-to-it-like-a-person side of WalletWise.
+The AI gets your money story (balances, goals, budgets, month-by-month totals, recent or all
+transactions, and what it remembers about you) plus tools (tools.py) to look things up and save
+new entries. Which AI it uses is a "brain" from brains.py:
 
-Needs:  pip install anthropic   and an API key in the ANTHROPIC_API_KEY environment variable.
+  * Ollama (default): FREE, runs on your own computer, data stays private.
+  * Claude: optional, paid, smarter.     Choose with:  set WALLETWISE_AI=claude
 """
 
 from __future__ import annotations
@@ -12,22 +13,19 @@ from __future__ import annotations
 import json
 import os
 from datetime import date
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Optional
 
 from . import advisor, reports
-from .constants import (
-    APP_NAME, CURRENCY, EMERGENCY_FUND_MONTHS, MONTHLY_WANTS_CAP,
-)
+from .brains import BrainError, ClaudeBrain, OllamaBrain, ToolResult
+from .constants import APP_NAME, CURRENCY, EMERGENCY_FUND_MONTHS, MONTHLY_WANTS_CAP
 from .db import Database
 from .reports import month_name, pkr
 from .tools import MoneyTools, ledger_csv
 
-MODEL = os.environ.get("WALLETWISE_MODEL", "claude-opus-5-5")
-EFFORT = os.environ.get("WALLETWISE_EFFORT", "medium")   # low | medium | high
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_TOOL_ROUNDS = 12
+RECENT_FOR_LOCAL = 25      # small local models get the latest transactions; tools fetch the rest
 
-# The stable part of the instructions. It never changes, so it is cached between messages.
+# The stable part of the instructions (the same in every chat, so it can be cached).
 INSTRUCTIONS = f"""You are {APP_NAME}, a personal money assistant that lives inside the user's own money \
 tracker app. You know their whole money story: every transaction since they started tracking, their \
 accounts, budgets, goals, and the facts you have remembered about them. You talk like a caring, honest \
@@ -43,7 +41,8 @@ How to talk
 
 Using your tools
 - The money snapshot below was taken when this chat started. After you save anything, or when you need
-  exact up-to-date figures, call get_overview or find_transactions instead of doing mental math on old numbers.
+  exact up-to-date figures, call get_overview, find_transactions or spending_report instead of doing
+  mental math on old numbers. Use the tools for any total you are not sure about.
 - Logging: when the user mentions money they received or spent ("aaj 250 ka lunch cash se",
   "Ammi ne 1000 diye", "got 3000 for a logo"), call add_transaction. Fill the date (default today), type,
   category, amount, account, a short note in their words, and Need/Want for expenses. If the account is
@@ -73,23 +72,22 @@ Boundaries
 """
 
 
-def snapshot(db: Database, today: date) -> str:
-    """Everything Claude should know at the start of a chat, as plain text."""
+def snapshot(db: Database, today: date, full_ledger: bool = True) -> str:
+    """Everything the AI should know at the start of a chat, as plain text."""
     txns = db.transactions()
     accounts = db.accounts()
     bal = reports.balances(accounts, txns)
     name = db.get_setting("name") or "the user"
     parts = [f"Today is {today:%A, %d %B %Y}. You are talking to {name}."]
 
-    memories = db.memories()
     parts.append("\n## What you remember about them")
-    parts += [f"- [{m['id']}] {m['fact']}" for m in memories] or ["- (nothing yet; use remember as you learn)"]
+    parts += [f"- [{m['id']}] {m['fact']}" for m in db.memories()] or ["- (nothing yet; use remember as you learn)"]
 
     parts.append("\n## Accounts (current balances)")
     if accounts:
         for a in accounts:
             parts.append(f"- {a.name} ({a.kind}): {pkr(bal[a.name])}"
-                         f" — tracked from {a.opening_date:%d %b %Y}{'; ' + a.note if a.note else ''}")
+                         f" (tracked from {a.opening_date:%d %b %Y}){'; ' + a.note if a.note else ''}")
         parts.append(f"- Net worth: {pkr(sum(bal.values()))}")
     else:
         parts.append("- No accounts set up yet. Suggest adding them with: python main.py account add ...")
@@ -103,19 +101,29 @@ def snapshot(db: Database, today: date) -> str:
                   f"{' in ' + g.account if g.account else ''}{' by ' + g.target_date if g.target_date else ''}"
                   for g in db.goals()]
 
-    if txns:
-        parts.append("\n## Month by month")
-        for m, t in reports.monthly_totals(txns).items():
-            parts.append(f"- {month_name(m)}: in {pkr(t.income)} (earned {pkr(t.earned)}), "
-                         f"out {pkr(t.spent)} (wants {pkr(t.wants)}), net {pkr(t.saved)}")
-        tips = advisor.suggest(txns, accounts, db.budgets(), db.goals(), today=today)
-        if tips:
-            parts.append("\n## Patterns WalletWise's rules noticed")
-            parts += [f"- {s.title}" for s in tips]
+    if not txns:
+        parts.append("\nNo transactions yet. Help them log their first ones.")
+        return "\n".join(parts)
+
+    parts.append(f"\n## Month by month (tracking since {txns[0].date:%d %b %Y})")
+    for m, t in reports.monthly_totals(txns).items():
+        parts.append(f"- {month_name(m)}: in {pkr(t.income)} (earned {pkr(t.earned)}), "
+                     f"out {pkr(t.spent)} (wants {pkr(t.wants)}), net {pkr(t.saved)}")
+    cats = reports.spending_by_category(txns)
+    parts.append("\n## All-time spending by category")
+    parts += [f"- {c}: {pkr(v)}" for c, v in cats.items()]
+    tips = advisor.suggest(txns, accounts, db.budgets(), db.goals(), today=today)
+    if tips:
+        parts.append("\n## Patterns WalletWise's rules noticed")
+        parts += [f"- {s.title}" for s in tips]
+    if full_ledger:
         parts.append(f"\n## Every transaction ({len(txns)} rows, oldest first)")
         parts.append(ledger_csv(db))
     else:
-        parts.append("\nNo transactions yet. Help them log their first ones.")
+        parts.append(f"\n## Latest {min(RECENT_FOR_LOCAL, len(txns))} of {len(txns)} transactions "
+                     "(use find_transactions for older ones)")
+        parts.append(ledger_csv(db, max_rows=RECENT_FOR_LOCAL).replace(
+            "use find_transactions for them", "use find_transactions"))
     return "\n".join(parts)
 
 
@@ -124,84 +132,62 @@ def ask_yes_no(question: str) -> bool:
     return answer in ("y", "yes", "haan", "han", "ji", "ok")
 
 
-class MoneyChat:
-    """One conversation with Claude. `client` can be swapped for a fake one in tests."""
+def make_brain(db: Database, tools: MoneyTools, today: date, which: Optional[str] = None):
+    which = (which or os.environ.get("WALLETWISE_AI") or "ollama").lower()
+    if which == "claude":
+        return ClaudeBrain([INSTRUCTIONS, snapshot(db, today, full_ledger=True)], tools.schemas())
+    if which == "ollama":
+        return OllamaBrain(INSTRUCTIONS + "\n" + snapshot(db, today, full_ledger=False), tools.schemas())
+    raise BrainError(f"Unknown WALLETWISE_AI '{which}'. Use ollama (free) or claude (paid).")
 
-    def __init__(self, db: Database, client: Any = None, confirm: Callable[[str], bool] = ask_yes_no,
+
+class MoneyChat:
+    """One conversation. `brain` can be any object with the brains.py interface (tests use fakes)."""
+
+    def __init__(self, db: Database, brain=None, confirm: Callable[[str], bool] = ask_yes_no,
                  today: Optional[date] = None, show: Callable[[str], None] = print):
-        if client is None:
-            import anthropic  # imported here so the rest of WalletWise works without it
-            client = anthropic.Anthropic()
-        self.client = client
         self.db = db
         self.today = today or date.today()
         self.tools = MoneyTools(db, confirm, self.today)
+        self.brain = brain or make_brain(db, self.tools, self.today)
         self.show = show
-        self.messages: List[Dict[str, Any]] = []
-        self.system = [
-            {"type": "text", "text": INSTRUCTIONS},
-            {"type": "text", "text": snapshot(db, self.today)},
-        ]
-
-    def _create(self):
-        return self.client.beta.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            system=self.system,
-            messages=self.messages,
-            tools=self.tools.schemas(),
-            output_config={"effort": EFFORT},
-            cache_control={"type": "ephemeral"},   # cache the long money story between messages
-            betas=[FALLBACK_BETA],
-            fallbacks="default",                   # if a request is declined, retry on a fallback model
-        )
 
     def send(self, text: str) -> str:
-        """Send one user message, let Claude use tools as needed, return its final text."""
-        start = len(self.messages)
-        self.messages.append({"role": "user", "content": text})
+        """Send one user message, let the AI use tools as needed, return its final text."""
+        mark = self.brain.mark()
+        self.brain.add_user(text)
         try:
-            return self._run_turn(start)
+            return self._run_turn(mark)
         except Exception:
-            del self.messages[start:]   # forget the half-finished turn, keep the earlier chat
+            self.brain.rollback(mark)   # forget the half-finished turn, keep the earlier chat
             raise
 
-    def _run_turn(self, start: int) -> str:
-        replies: List[str] = []
+    def _run_turn(self, mark: int) -> str:
+        replies = []
         for _ in range(MAX_TOOL_ROUNDS):
-            response = self._create()
-            if response.stop_reason == "refusal":
-                del self.messages[start:]          # drop this exchange so the chat can go on
+            step = self.brain.step()
+            if step.stopped == "refusal":
+                self.brain.rollback(mark)
                 return "Sorry, I can't help with that one. Try asking another way."
-            self.messages.append(response.to_param())
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    replies.append(block.text)
-                    self.show(block.text)
-            if response.stop_reason != "tool_use":
-                if response.stop_reason == "max_tokens":
+            for t in step.texts:
+                replies.append(t)
+                self.show(t)
+            if not step.calls:
+                if step.stopped == "max_tokens":
                     self.show("(reply was cut off; ask me to continue)")
                 break
-            results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
+            results: list[ToolResult] = []
+            for call in step.calls:
                 try:
-                    content, is_error = self.tools.run(block.name, dict(block.input)), False
-                except Exception as e:  # any tool problem goes back to Claude, which can retry or explain
+                    content, is_error = self.tools.run(call.name, call.args), False
+                except Exception as e:  # any tool problem goes back to the AI, which can retry or explain
                     content, is_error = json.dumps({"error": str(e)}), True
-                if block.name == "remember" and not is_error:
-                    self.show(f"   📝 Remembered: {block.input.get('fact')}")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": content, "is_error": is_error})
-            self.messages.append({"role": "user", "content": results})
+                if call.name == "remember" and not is_error:
+                    self.show(f"   📝 Remembered: {call.args.get('fact')}")
+                results.append((call, content, is_error))
+            self.brain.add_results(results)
         return "\n".join(replies)
 
-
-KEY_HELP = """❌ No Anthropic API key found. Get one at console.anthropic.com, then set it:
-   Windows:    setx ANTHROPIC_API_KEY "sk-ant-..."     (then open a NEW terminal)
-   Mac/Linux:  export ANTHROPIC_API_KEY="sk-ant-..."
-"""
 
 HELP = """Talk to me like a person, e.g.
   • aaj 250 ka lunch cash se kiya
@@ -212,17 +198,20 @@ Commands: /memory (what I remember)  /forget <id>  /new (fresh chat)  /exit"""
 
 
 def chat_loop(db: Database) -> None:
-    try:
-        import anthropic
-    except ImportError:
-        print("The AI chat needs the Anthropic SDK. Install it with:  pip install anthropic")
-        return
     if not db.get_setting("name"):
         name = input("👋 What should I call you? ").strip()
         if name:
             db.set_setting("name", name)
-    chat = MoneyChat(db, show=lambda text: print(f"\n💼 {text}"))
-    print(f"\n===== 💼 {APP_NAME} AI =====\n{HELP}")
+    show = lambda text: print(f"\n💼 {text}")  # noqa: E731
+    try:
+        chat = MoneyChat(db, show=show)
+        chat.brain.check()
+    except BrainError as e:
+        print(f"❌ {e}")
+        return
+    print(f"\n===== 💼 {APP_NAME} AI · {chat.brain.name} · {chat.brain.model} =====\n{HELP}")
+    if isinstance(chat.brain, OllamaBrain):
+        print("(The first answer can take a minute while the model loads on your laptop.)")
     while True:
         try:
             text = input("\n🧑 You: ").strip()
@@ -246,22 +235,12 @@ def chat_loop(db: Database) -> None:
             print("  🗑️ Forgotten." if arg.isdigit() and db.delete_memory(int(arg)) else "  Usage: /forget <id>")
             continue
         if text == "/new":
-            chat = MoneyChat(db, show=chat.show)
+            chat = MoneyChat(db, show=show)
             print("  ✨ Fresh chat started (with your latest data).")
             continue
         try:
             chat.send(text)
-        except anthropic.AuthenticationError:
-            print("❌ Your API key was rejected. Check ANTHROPIC_API_KEY.")
-            return
-        except TypeError as e:
-            if "authentication" not in str(e).lower():
-                raise
-            print(KEY_HELP)
-            return
-        except anthropic.RateLimitError:
-            print("⏳ Too many requests right now. Wait a minute and try again.")
-        except anthropic.APIConnectionError:
-            print("📶 No connection to Claude. Check your internet and try again.")
-        except anthropic.APIStatusError as e:
-            print(f"⚠️ Claude API error ({e.status_code}): {e.message}")
+        except BrainError as e:
+            print(f"❌ {e}")
+        except Exception as e:  # e.g. Claude API errors: show them and keep chatting
+            print(f"⚠️ {type(e).__name__}: {e}")

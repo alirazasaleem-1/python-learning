@@ -1,4 +1,4 @@
-"""Tests for the AI chat, using a fake Claude client (no internet, no API key)."""
+"""Tests for WalletWise AI with fake brains: no internet, no Ollama, no API key needed."""
 
 import os
 import tempfile
@@ -6,17 +6,37 @@ import unittest
 from datetime import date
 from types import SimpleNamespace as NS
 
-from walletwise.assistant import MoneyChat
-from walletwise.db import Account, Database
+from walletwise.assistant import INSTRUCTIONS, MoneyChat, snapshot
+from walletwise.brains import ClaudeBrain, OllamaBrain
+from walletwise.db import Account, Database, Transaction
+from walletwise.tools import MoneyTools
+
+TODAY = date(2026, 11, 16)
 
 
-def text(t):
-    return NS(type="text", text=t)
+# ---------------------------------------------------------------- fake Ollama server
+
+class FakeOllama:
+    """Plays the part of Ollama's /api/chat endpoint with scripted replies."""
+
+    def __init__(self, replies):
+        self.replies, self.requests = list(replies), []
+
+    def __call__(self, path, body):
+        assert path == "/api/chat"
+        self.requests.append({**body, "messages": [dict(m) for m in body["messages"]]})
+        return {"message": self.replies.pop(0), "done": True, "done_reason": "stop"}
 
 
-def tool_use(id_, name, inp):
-    return NS(type="tool_use", id=id_, name=name, input=inp)
+def ollama_call(name, **args):
+    return {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": name, "arguments": args}}]}
 
+
+def ollama_text(text):
+    return {"role": "assistant", "content": text}
+
+
+# ---------------------------------------------------------------- fake Claude client
 
 class FakeResponse:
     def __init__(self, stop_reason, content):
@@ -26,9 +46,7 @@ class FakeResponse:
         return {"role": "assistant", "content": [vars(b) for b in self.content]}
 
 
-class FakeClient:
-    """Replays scripted responses and records every request."""
-
+class FakeClaude:
     def __init__(self, responses):
         self.responses, self.requests = list(responses), []
         self.beta = NS(messages=NS(create=self.create))
@@ -38,91 +56,113 @@ class FakeClient:
         return self.responses.pop(0)
 
 
-class AssistantTest(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(os.path.join(self.tmp.name, "t.db"))
-        self.db.save_account(Account("Cash", "Cash", 1000, date(2026, 11, 1)))
-        self.today = date(2026, 11, 16)
+        self.db.save_account(Account("Physical Cash", "Cash", 1000, date(2026, 11, 1)))
+        self.asked = []
 
     def tearDown(self):
         self.db.close()
         self.tmp.cleanup()
 
-    def chat(self, responses, answer=True):
-        self.asked = []
-        client = FakeClient(responses)
-        chat = MoneyChat(self.db, client=client, today=self.today, show=lambda t: None,
-                         confirm=lambda q: self.asked.append(q) or answer)
-        return chat, client
+    def confirm(self, answer=True):
+        return lambda q: self.asked.append(q) or answer
 
-    def test_logs_expense_after_confirmation(self):
-        chat, client = self.chat([
-            FakeResponse("tool_use", [tool_use("t1", "add_transaction", {
-                "date": "2026-11-16", "type": "Expense", "category": "Food & Snacks", "amount": 250,
-                "account": "Cash", "note": "Lunch", "need_want": "Need"})]),
-            FakeResponse("end_turn", [text("Saved! Cash is now PKR 750.")]),
+    def ollama_chat(self, replies, answer=True):
+        server = FakeOllama(replies)
+        tools = MoneyTools(self.db, self.confirm(answer), TODAY)
+        brain = OllamaBrain("system", tools.schemas(), model="qwen2.5:3b", post=server)
+        return MoneyChat(self.db, brain=brain, confirm=self.confirm(answer), today=TODAY,
+                         show=lambda t: None), server
+
+
+class OllamaTest(Base):
+    def test_logs_expense_free_and_locally(self):
+        chat, server = self.ollama_chat([
+            ollama_call("add_transaction", date="2026-11-16", type="expense", category="food & snacks",
+                        amount="250", account="physical cash", note="Lunch", need_want="need", extra="ignored"),
+            ollama_text("Lunch save ho gaya ✅"),
         ])
-        reply = chat.send("aaj 250 ka lunch cash se")
-        self.assertEqual(reply, "Saved! Cash is now PKR 750.")
-        self.assertEqual(len(self.asked), 1)
-        self.assertEqual(self.db.transactions()[-1].amount, 250)
-        result = client.requests[1]["messages"][-1]["content"][0]
-        self.assertEqual(result["tool_use_id"], "t1")
-        self.assertIn('"new_balance": 750.0', result["content"])
+        self.assertEqual(chat.send("aaj 250 ka lunch cash se"), "Lunch save ho gaya ✅")
+        t = self.db.transactions()[-1]
+        self.assertEqual((t.type, t.category, t.amount, t.account, t.need_want),
+                         ("Expense", "Food & Snacks", 250, "Physical Cash", "Need"))
+        tool_msg = server.requests[1]["messages"][-1]
+        self.assertEqual((tool_msg["role"], tool_msg["tool_name"]), ("tool", "add_transaction"))
+        self.assertIn('"new_balance": 750.0', tool_msg["content"])
+        req = server.requests[0]
+        self.assertFalse(req["stream"])
+        self.assertEqual(req["tools"][0]["type"], "function")
+        self.assertIn("parameters", req["tools"][0]["function"])
 
-    def test_declined_save_writes_nothing(self):
-        chat, _ = self.chat([
-            FakeResponse("tool_use", [tool_use("t1", "add_transaction", {
-                "date": "2026-11-16", "type": "Income", "category": "Pocket Money", "amount": 500,
-                "account": "Cash", "note": "Ammi"})]),
-            FakeResponse("end_turn", [text("Okay, not saved.")]),
-        ], answer=False)
-        chat.send("Ammi ne 500 diye")
+    def test_bad_input_is_sent_back_as_error(self):
+        chat, server = self.ollama_chat([
+            ollama_call("add_transaction", date="2026-11-16", type="Expense", category="Snacks",
+                        amount=100, account="Physical Cash", note="Samosa"),
+            ollama_text("Which category?"),
+        ])
+        chat.send("100 ka samosa")
+        self.assertIn("not a valid category", server.requests[1]["messages"][-1]["content"])
         self.assertEqual(self.db.transactions(), [])
 
-    def test_tool_errors_go_back_to_claude(self):
-        chat, client = self.chat([
-            FakeResponse("tool_use", [tool_use("t1", "add_transaction", {
-                "date": "2026-11-16", "type": "Expense", "category": "Transport", "amount": 100,
-                "account": "Wallet That Does Not Exist", "note": "Rickshaw"})]),
-            FakeResponse("end_turn", [text("Which account?")]),
-        ])
-        chat.send("100 rickshaw")
-        result = client.requests[1]["messages"][-1]["content"][0]
-        self.assertTrue(result["is_error"])
-        self.assertIn("Unknown account", result["content"])
+    def test_string_arguments_and_think_tags(self):
+        reply = {"role": "assistant", "content": "<think>hmm</think>",
+                 "tool_calls": [{"function": {"name": "get_overview", "arguments": "{}"}}]}
+        chat, _ = self.ollama_chat([reply, ollama_text("<think>ok</think>Net worth PKR 1,000")])
+        self.assertEqual(chat.send("kitne paise hain?"), "Net worth PKR 1,000")
 
-    def test_memory_and_snapshot(self):
-        chat, _ = self.chat([
-            FakeResponse("tool_use", [tool_use("t1", "remember", {"fact": "Saving for a laptop SSD"})]),
-            FakeResponse("end_turn", [text("Noted!")]),
-        ])
-        chat.send("I'm saving for an SSD")
-        self.assertEqual([m["fact"] for m in self.db.memories()], ["Saving for a laptop SSD"])
-        fresh, _ = self.chat([])
-        self.assertIn("Saving for a laptop SSD", fresh.system[1]["text"])
-        self.assertIn("Cash (Cash): PKR 1,000", fresh.system[1]["text"])
-
-    def test_history_is_kept_and_failed_turn_rolled_back(self):
-        chat, client = self.chat([FakeResponse("end_turn", [text("Hi!")])])
+    def test_declined_and_history(self):
+        chat, server = self.ollama_chat([
+            ollama_call("add_transaction", date="2026-11-16", type="Income", category="Pocket Money",
+                        amount=500, account="Physical Cash", note="Ammi"),
+            ollama_text("Theek hai, save nahi kiya."),
+            ollama_text("Salam!"),
+        ], answer=False)
+        chat.send("Ammi ne 500 diye")
         chat.send("salam")
-        self.assertEqual([m["role"] for m in chat.messages], ["user", "assistant"])
-        client.responses = []  # next request raises IndexError, like a network error
-        with self.assertRaises(IndexError):
-            chat.send("are you there?")
-        self.assertEqual(len(chat.messages), 2)
+        self.assertEqual(self.db.transactions(), [])
+        roles = [m["role"] for m in server.requests[-1]["messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "tool", "assistant", "user"])
 
-    def test_request_settings(self):
-        chat, client = self.chat([FakeResponse("end_turn", [text("ok")])])
-        chat.send("hi")
-        req = client.requests[0]
-        self.assertEqual(req["model"], "claude-opus-5-5")
-        self.assertEqual(req["fallbacks"], "default")
-        names = {t["name"] for t in req["tools"]}
-        self.assertTrue({"add_transaction", "transfer_money", "remember", "find_transactions"} <= names)
-        for t in req["tools"]:
-            self.assertFalse(t["input_schema"]["additionalProperties"])
+    def test_failed_turn_is_rolled_back(self):
+        chat, server = self.ollama_chat([ollama_text("hi")])
+        chat.send("salam")
+        with self.assertRaises(IndexError):        # no scripted reply left = like a crash
+            chat.send("hello?")
+        self.assertEqual(len(chat.brain.messages), 3)
+
+
+class ClaudeTest(Base):
+    def test_claude_brain_still_works(self):
+        client = FakeClaude([
+            FakeResponse("tool_use", [NS(type="tool_use", id="t1", name="remember",
+                                         input={"fact": "Saving for an SSD"})]),
+            FakeResponse("end_turn", [NS(type="text", text="Noted!")]),
+        ])
+        tools = MoneyTools(self.db, self.confirm(), TODAY)
+        brain = ClaudeBrain([INSTRUCTIONS, "snapshot"], tools.schemas(), client=client)
+        chat = MoneyChat(self.db, brain=brain, today=TODAY, show=lambda t: None)
+        self.assertEqual(chat.send("saving for an SSD"), "Noted!")
+        self.assertEqual([m["fact"] for m in self.db.memories()], ["Saving for an SSD"])
+        result = client.requests[1]["messages"][-1]["content"][0]
+        self.assertEqual(result["tool_use_id"], "t1")
+        self.assertEqual(client.requests[0]["fallbacks"], "default")
+
+
+class SnapshotTest(Base):
+    def test_local_snapshot_is_compact(self):
+        for i in range(40):
+            self.db.add_transaction(Transaction(date(2026, 11, 2), "Expense", "Transport", 100 + i,
+                                                "Physical Cash", f"ride {i}", "Need"))
+        self.db.add_memory("Walks to university")
+        full, compact = snapshot(self.db, TODAY), snapshot(self.db, TODAY, full_ledger=False)
+        self.assertIn('"ride 0"', full)
+        self.assertNotIn('"ride 0"', compact)
+        self.assertIn("ride 39", compact)
+        self.assertIn("Walks to university", compact)
+        self.assertLess(len(compact), len(full))
 
 
 if __name__ == "__main__":

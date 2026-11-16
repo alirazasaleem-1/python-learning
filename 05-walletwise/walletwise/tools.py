@@ -10,6 +10,7 @@ If you say no, nothing is saved and Claude is told you declined.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections import defaultdict
 from datetime import date
@@ -20,7 +21,7 @@ from .constants import (
     CATEGORIES, EXPENSE, EXPENSE_CATEGORIES, NEED_WANT, TRANSFER_CATEGORIES, TRANSFER_IN,
     TRANSFER_OUT, TYPES,
 )
-from .csv_io import parse_date
+from .csv_io import parse_amount, parse_date
 from .db import Database, Goal, Transaction
 from .reports import month_key, pkr
 
@@ -30,6 +31,18 @@ Confirm = Callable[[str], bool]
 def _txn_dict(t: Transaction) -> Dict[str, Any]:
     return {"id": t.id, "date": t.date.isoformat(), "type": t.type, "category": t.category,
             "amount": t.amount, "account": t.account, "note": t.note, "need_want": t.need_want}
+
+
+def _pick(value: Any, allowed: List[str], what: str) -> str:
+    """Match a value to the allowed list, ignoring case: 'expense' -> 'Expense'."""
+    for option in allowed:
+        if str(value).strip().lower() == option.lower():
+            return option
+    raise ValueError(f"'{value}' is not a valid {what}. Use one of: {', '.join(allowed)}")
+
+
+def _amount(value: Any) -> float:
+    return abs(float(value)) if isinstance(value, (int, float)) else parse_amount(str(value))
 
 
 class MoneyTools:
@@ -129,14 +142,15 @@ class MoneyTools:
         handler = getattr(self, f"tool_{name}", None)
         if handler is None:
             raise ValueError(f"Unknown tool {name}")
-        result = handler(**args)
+        # Small local models sometimes add extra fields or send "" for optional ones: tidy that up.
+        params = inspect.signature(handler).parameters
+        clean = {k: v for k, v in args.items() if k in params and v not in ("", None)}
+        result = handler(**clean)
         return json.dumps(result, ensure_ascii=False, default=str)
 
     def _check_account(self, name: str) -> str:
         names = [a.name for a in self.db.accounts()]
-        if names and name not in names:
-            raise ValueError(f"Unknown account '{name}'. Accounts: {names}")
-        return name
+        return _pick(name, names, "account") if names else name
 
     # ------------------------------------------------------------ read tools
 
@@ -163,6 +177,8 @@ class MoneyTools:
     def tool_find_transactions(self, month=None, date_from=None, date_to=None, type=None, category=None,
                                account=None, search=None, limit=50) -> Dict[str, Any]:
         rows = self.db.transactions()
+        type = type and _pick(type, TYPES, "type")
+        category = category and _pick(category, CATEGORIES, "category")
         if month:
             rows = [t for t in rows if month_key(t.date) == month]
         if date_from:
@@ -183,6 +199,8 @@ class MoneyTools:
                 "transactions": [_txn_dict(t) for t in rows]}
 
     def tool_spending_report(self, group_by, type=EXPENSE, date_from=None, date_to=None) -> Dict[str, Any]:
+        group_by = _pick(group_by, ["category", "month", "weekday", "need_want", "account"], "group_by")
+        type = _pick(type, TYPES, "type")
         rows = [t for t in self.db.transactions() if t.type == type]
         if date_from:
             rows = [t for t in rows if t.date >= parse_date(date_from)]
@@ -212,8 +230,11 @@ class MoneyTools:
     # ------------------------------------------------------------ write tools
 
     def tool_add_transaction(self, date, type, category, amount, account, note, need_want="") -> Dict[str, Any]:
-        t = Transaction(parse_date(date), type, category, abs(float(amount)),
-                        self._check_account(account), note, need_want if type == EXPENSE else "")
+        type = _pick(type, ["Income", "Expense"], "type")
+        category = _pick(category, CATEGORIES, "category")
+        need_want = _pick(need_want, NEED_WANT, "need_want") if need_want and type == EXPENSE else ""
+        t = Transaction(parse_date(date), type, category, _amount(amount),
+                        self._check_account(account), note, need_want)
         summary = (f"{t.date:%d %b %Y} · {t.type} · {pkr(t.amount)} · {t.category} · {t.account}"
                    f"{' · ' + t.need_want if t.need_want else ''} · {t.note}")
         if not self.confirm(f"Save this? {summary}"):
@@ -225,7 +246,8 @@ class MoneyTools:
         source, target = self._check_account(source), self._check_account(target)
         if source == target:
             raise ValueError("source and target must be different accounts")
-        day, amount = parse_date(date), abs(float(amount))
+        category = _pick(category, TRANSFER_CATEGORIES, "category")
+        day, amount = parse_date(date), _amount(amount)
         if not self.confirm(f"Move {pkr(amount)} from {source} to {target} on {day:%d %b %Y} ({category})?"):
             return {"saved": False, "reason": "The user declined."}
         self.db.add_transaction(Transaction(day, TRANSFER_OUT, category, amount, source, note))
@@ -233,6 +255,7 @@ class MoneyTools:
         return {"saved": True, "balances": {source: self._balance(source), target: self._balance(target)}}
 
     def tool_delete_transaction(self, id) -> Dict[str, Any]:
+        id = int(id)
         t = next((x for x in self.db.transactions() if x.id == id), None)
         if t is None:
             return {"deleted": False, "reason": f"No transaction #{id}"}
@@ -242,12 +265,14 @@ class MoneyTools:
         return {"deleted": True, "transaction": _txn_dict(t)}
 
     def tool_set_budget(self, category, monthly_limit) -> Dict[str, Any]:
+        category, monthly_limit = _pick(category, EXPENSE_CATEGORIES, "category"), _amount(monthly_limit)
         if not self.confirm(f"Set the {category} budget to {pkr(monthly_limit)} a month?"):
             return {"saved": False, "reason": "The user declined."}
-        self.db.set_budget(category, abs(float(monthly_limit)))
+        self.db.set_budget(category, monthly_limit)
         return {"saved": True}
 
     def tool_save_goal(self, name, target, account="", target_date="", note="") -> Dict[str, Any]:
+        target = _amount(target)
         if account:
             self._check_account(account)
         if target_date:
@@ -255,14 +280,14 @@ class MoneyTools:
         if not self.confirm(f"Save goal '{name}': {pkr(target)}"
                             f"{' in ' + account if account else ''}{' by ' + target_date if target_date else ''}?"):
             return {"saved": False, "reason": "The user declined."}
-        self.db.save_goal(Goal(name, abs(float(target)), account, target_date, note))
+        self.db.save_goal(Goal(name, target, account, target_date, note))
         return {"saved": True}
 
     def tool_remember(self, fact) -> Dict[str, Any]:
         return {"saved": True, "id": self.db.add_memory(fact)}
 
     def tool_forget(self, id) -> Dict[str, Any]:
-        return {"deleted": self.db.delete_memory(id)}
+        return {"deleted": self.db.delete_memory(int(id))}
 
     def _balance(self, account_name: str) -> Optional[float]:
         acc = next((a for a in self.db.accounts() if a.name == account_name), None)

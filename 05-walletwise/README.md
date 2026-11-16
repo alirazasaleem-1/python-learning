@@ -3,16 +3,23 @@
 A personal money manager that knows your whole money story, from the first rupee to today, and gives you suggestions based on it.
 
 It has two sides:
-- **💬 WalletWise AI**: a chat assistant powered by Claude. Talk to it in English, Urdu or Roman Urdu: it logs your spending, answers questions about your money and gives advice based on your real history.
+- **💬 WalletWise AI**: a chat assistant. Talk to it in English, Urdu or Roman Urdu: it logs your spending, answers questions about your money and gives advice based on your real history. **Free by default**: it runs an open AI model on your own computer with [Ollama](https://ollama.com).
 - **🧮 Classic commands**: a fast command-line tracker with reports, a money story and rule-based suggestions. Pure Python standard library, works offline.
 
-## 💬 WalletWise AI
+## 💬 WalletWise AI (free, private, offline)
 
-```bash
-pip install -r requirements.txt          # installs the anthropic SDK
-setx ANTHROPIC_API_KEY "sk-ant-..."      # Windows (open a new terminal after)
-python main.py chat
-```
+One-time setup:
+1. Install **Ollama** (free) from https://ollama.com/download and open it. It runs quietly in the background.
+2. Download a model once (about 2 GB):
+   ```bash
+   ollama pull qwen2.5:3b
+   ```
+3. Chat:
+   ```bash
+   python main.py chat
+   ```
+
+No account, no API key, no monthly bill. After the download it works without internet, and **your money data never leaves your laptop**.
 
 ```
 🧑 You: aaj 250 ka lunch cash se kiya aur 120 ka rickshaw
@@ -20,21 +27,29 @@ python main.py chat
    ❓ Save this? 16 Nov 2026 · Expense · PKR 120 · Transport · Physical Cash · Need · Rickshaw (y/n): y
 💼 Dono save ho gaye ✅ Cash ab PKR 60 bacha hai...
 
+🧑 You: sab se zyada paisa kahan gaya?
 🧑 You: can I afford a 5000 PKR course next month?
-🧑 You: why did I overspend in October?
 🧑 You: I got an internship, 15000 a month from December
    📝 Remembered: Starts an internship in December paying PKR 15,000/month
 ```
 
-**How it works** (`walletwise/assistant.py`, `walletwise/tools.py`)
-- At the start of every chat Claude gets your **whole money story**: every transaction, balances, budgets, goals, month-by-month totals, the rule-based insights, and its **long-term memory** of you.
-- It has **tools** to search transactions, build spending reports, log income/expenses, move money between accounts, set budgets and goals, and remember or forget facts about you.
+**How it works** (`walletwise/assistant.py`, `walletwise/tools.py`, `walletwise/brains.py`)
+- At the start of every chat the AI gets your **money story**: balances, budgets, goals, month-by-month totals, spending by category, the rule-based insights, your latest transactions and its **long-term memory** of you.
+- It has **tools** to search all transactions, build spending reports, log income/expenses, move money between accounts, set budgets and goals, and remember or forget facts about you. The tools do the maths, so even a small model gives correct totals.
 - **Nothing is saved without your OK.** Every change asks `(y/n)` first.
-- Memories live in your local database (`/memory` shows them, `/forget <id>` deletes one).
 - Chat commands: `/memory`, `/forget <id>`, `/new`, `/help`, `/exit`.
 
-**Cost:** each message costs a little API credit (with prompt caching, usually around 1-3 US cents on the default model).
-Settings via environment variables: `WALLETWISE_MODEL` (default `claude-opus-5-5`) and `WALLETWISE_EFFORT` (`low`/`medium`/`high`, default `medium`).
+**Choosing a model** (`set WALLETWISE_MODEL=...` on Windows, `export` on Mac/Linux):
+
+| Model | Download | Notes |
+|---|---|---|
+| `qwen2.5:3b` (default) | ~2 GB | Good balance for laptops with 8 GB RAM |
+| `qwen2.5:1.5b` | ~1 GB | Faster on older laptops, a bit less smart |
+| `qwen2.5:7b` | ~4.7 GB | Smarter, needs 16 GB RAM, slower without a GPU |
+
+On a laptop without a graphics card the first reply can take a minute while the model loads; later replies are quicker.
+
+**Optional: Claude (paid).** For a smarter, faster brain: `pip install anthropic`, set `ANTHROPIC_API_KEY`, then `set WALLETWISE_AI=claude`. This costs API credit per message and sends your data to Anthropic.
 
 ## 🧮 Classic commands
 
@@ -97,14 +112,14 @@ To add your own idea, write a function `def my_rule(ctx) -> list[Suggestion]` an
 
 ## 🔒 Privacy
 
-Your data (transactions, AI memories) is stored in `data/walletwise.db`. The `data/` folder is in `.gitignore`, so **your real money data never gets pushed to GitHub**. Only the fake `sample_data/` is in the repo. When you use the AI chat, your money data is sent to the Anthropic API to answer you.
+Your data (transactions, AI memories) is stored in `data/walletwise.db`. The `data/` folder is in `.gitignore`, so **your real money data never gets pushed to GitHub**. Only the fake `sample_data/` is in the repo. With the default Ollama brain the AI chat is fully local too. Only the optional Claude brain sends your data out (to Anthropic).
 Use `--db path/to/file.db` (or the `WALLETWISE_DB` environment variable) to keep the database somewhere else.
 
 ## 🧪 Tests
 
 ```bash
 cd 05-walletwise
-python -m unittest discover -s tests -v     # no API key needed: the AI tests use a fake client
+python -m unittest discover -s tests -v     # no Ollama or API key needed: the AI tests use fakes
 ```
 
 ## 📁 Structure
@@ -129,6 +144,6 @@ python -m unittest discover -s tests -v     # no API key needed: the AI tests us
 ## 🗺️ Roadmap
 
 - [x] **Step 1:** CLI + SQLite, budgets, goals, story, rule-based suggestions
-- [x] **Step 2:** WalletWise AI chat with tools and long-term memory
+- [x] **Step 2:** WalletWise AI chat with tools and long-term memory, free with Ollama (Claude optional)
 - [ ] **Step 3:** charts with `matplotlib`
 - [ ] **Step 4:** web app (Streamlit/Flask) to chat from the phone
