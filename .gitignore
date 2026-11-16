@@ -5,3 +5,7 @@ venv/
 .env
 *.key
 PyWhatKit_DB.txt
+
+# WalletWise: personal money data stays local
+05-walletwise/data/
+*.db

@@ -9,6 +9,7 @@ Everything I've written while learning Python, from my first programs to OOP, Pa
 | 02 | [OOP for ML engineering](02-oop) | Encapsulation, abstraction, inheritance and polymorphism, ending in a modular ML pipeline |
 | 03 | [Pandas 7-day challenge](03-pandas-7-day-challenge) | Pandas basics, filtering, cleaning and grouping, each with a mini project |
 | 04 | [Mini projects](04-mini-projects) | Standalone tools and games |
+| 05 | [WalletWise](05-walletwise) | My personal money manager: tracks every rupee, tells my money story and gives suggestions |
 
 ## 🛠️ Mini projects
 
