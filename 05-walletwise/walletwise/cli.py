@@ -267,9 +267,15 @@ def cmd_export(db: Database, args) -> None:
     print(f"✅ Exported {n} transaction(s) to {args.file}")
 
 
+def cmd_chat(db: Database, args) -> None:
+    from .assistant import chat_loop
+    chat_loop(db)
+
+
 # ---------------------------------------------------------------- menu
 
 MENU = [
+    ("💬 Chat with WalletWise AI", "chat"),
     ("Add income / expense", "add"),
     ("Move money between accounts", "transfer"),
     ("Recent transactions", "list"),
@@ -320,6 +326,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="walletwise", description=f"💼 {APP_NAME}: your personal money manager")
     p.add_argument("--db", help="path to the database file (default: data/walletwise.db)")
     sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("chat", help="💬 talk to the WalletWise AI about your money (needs an Anthropic API key)")
 
     a = sub.add_parser("add", help="add income or an expense (asks questions if you leave things out)")
     a.add_argument("--type", help="Income or Expense")
@@ -392,7 +400,7 @@ COMMANDS = {
     "add": cmd_add, "transfer": cmd_transfer, "list": cmd_list, "delete": cmd_delete,
     "balance": cmd_balance, "summary": cmd_summary, "story": cmd_story, "suggest": cmd_suggest,
     "budget": cmd_budget, "goal": cmd_goal, "account": cmd_account,
-    "import": cmd_import, "export": cmd_export,
+    "import": cmd_import, "export": cmd_export, "chat": cmd_chat,
 }
 
 

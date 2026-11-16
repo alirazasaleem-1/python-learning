@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS goals (
     target_date TEXT NOT NULL DEFAULT '',
     note        TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -190,3 +201,28 @@ class Database:
                  target_date=r["target_date"], note=r["note"])
             for r in rows
         ]
+
+    # ---------- memories (what the AI assistant knows about you) ----------
+    def add_memory(self, fact: str) -> int:
+        cur = self.conn.execute("INSERT INTO memories (fact, created_at) VALUES (?, ?)",
+                                (fact.strip(), date.today().isoformat()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def delete_memory(self, memory_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def memories(self) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+
+    # ---------- settings ----------
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)"
+                          " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        self.conn.commit()

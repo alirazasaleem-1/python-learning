@@ -15,7 +15,7 @@ from typing import Callable, Dict, List
 
 from . import reports
 from .constants import (
-    EMERGENCY_FUND_MONTHS, EXPENSE, INCOME, MONTHLY_WANTS_CAP, WANT,
+    EMERGENCY_FUND_MONTHS, EXPENSE, MONTHLY_WANTS_CAP, WANT,
 )
 from .db import Account, Budget, Goal, Transaction
 from .reports import month_key, month_name, pkr
